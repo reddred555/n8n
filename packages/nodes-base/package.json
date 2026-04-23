@@ -939,7 +939,7 @@
     "mqtt": "5.7.2",
     "mssql": "10.0.2",
     "mysql2": "catalog:",
-    "n8n-workflow": "workspace:*",
+    "@n8n/workflow": "workspace:*",
     "node-html-markdown": "1.2.0",
     "node-ssh": "13.2.0",
     "nodemailer": "catalog:",
