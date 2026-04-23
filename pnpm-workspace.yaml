@@ -179,3 +179,5 @@ minimumReleaseAgeExclude:
   - underscore
   - protobufjs
   - follow-redirects
+  # Renovate security update: pnpm@10.28.2
+  - pnpm@10.28.2
