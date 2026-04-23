@@ -179,3 +179,5 @@ minimumReleaseAgeExclude:
   - underscore
   - protobufjs
   - follow-redirects
+  # Renovate security update: zod@3.22.3
+  - zod@3.22.3
