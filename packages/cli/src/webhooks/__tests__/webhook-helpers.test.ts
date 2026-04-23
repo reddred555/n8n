@@ -2,6 +2,7 @@ import { Logger } from '@n8n/backend-common';
 import { mockInstance } from '@n8n/backend-test-utils';
 import type express from 'express';
 import { mock, type MockProxy } from 'jest-mock-extended';
+import * as n8nCore from 'n8n-core';
 import { BinaryDataService, ErrorReporter } from 'n8n-core';
 import type {
 	Workflow,
@@ -13,6 +14,7 @@ import type {
 	IWorkflowBase,
 	IRunExecutionData,
 	IExecuteData,
+	IWebhookData,
 } from 'n8n-workflow';
 import {
 	createDeferredPromise,
@@ -32,9 +34,19 @@ import {
 	setupResponseNodePromise,
 	prepareExecutionData,
 	handleHostedChatResponse,
+	executeWebhook,
 	_privateGetWebhookErrorMessage,
 } from '../webhook-helpers';
-import type { IWebhookResponseCallbackData } from '../webhook.types';
+import type { IWebhookResponseCallbackData, WebhookRequest } from '../webhook.types';
+
+import { ActiveExecutions } from '@/active-executions';
+import { AuthService } from '@/auth/auth.service';
+import { EventService } from '@/events/event.service';
+import { OwnershipService } from '@/services/ownership.service';
+import { WorkflowStatisticsService } from '@/services/workflow-statistics.service';
+import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-data';
+import { WorkflowRunner } from '@/workflow-runner';
+import { WebhookService } from '../webhook.service';
 
 jest.mock('stream/promises', () => ({
 	finished: jest.fn(),
@@ -718,5 +730,228 @@ describe('getWebhookErrorMessage', () => {
 		expect(_privateGetWebhookErrorMessage(err, 'Webhook')).toContain(
 			'Error: Workflow could not be started',
 		);
+	});
+});
+
+describe('executeWebhook - context establishment ordering', () => {
+	const callOrder: string[] = [];
+	let workflowRunner: ReturnType<typeof mockInstance<WorkflowRunner>>;
+	let webhookService: ReturnType<typeof mockInstance<WebhookService>>;
+	let activeExecutions: ReturnType<typeof mockInstance<ActiveExecutions>>;
+	let establishSpy: jest.SpyInstance;
+	let getBaseSpy: jest.SpyInstance;
+
+	beforeAll(() => {
+		mockInstance(Logger);
+		mockInstance(BinaryDataService);
+		mockInstance(ErrorReporter);
+		mockInstance(AuthService);
+		mockInstance(EventService);
+		mockInstance(WorkflowStatisticsService);
+	});
+
+	beforeEach(() => {
+		jest.restoreAllMocks();
+		callOrder.length = 0;
+
+		workflowRunner = mockInstance(WorkflowRunner);
+		webhookService = mockInstance(WebhookService);
+		activeExecutions = mockInstance(ActiveExecutions);
+		const ownershipService = mockInstance(OwnershipService);
+
+		ownershipService.getWorkflowProjectCached.mockResolvedValue({
+			id: 'project-1',
+		} as never);
+
+		webhookService.runWebhook.mockImplementation(async () => ({
+			workflowData: [[{ json: { headers: { authorization: 'Bearer token' } } }]],
+		}));
+
+		workflowRunner.run.mockImplementation(async () => {
+			callOrder.push('WorkflowRunner.run');
+			return 'exec-123';
+		});
+
+		activeExecutions.getPostExecutePromise.mockReturnValue(
+			new Promise(() => {
+				/* never resolves */
+			}),
+		);
+
+		// Spy on the n8n-core module export that webhook-helpers imports
+		establishSpy = jest
+			.spyOn(n8nCore, 'establishExecutionContext')
+			.mockImplementation(async (_workflow, runExecutionData) => {
+				// Simulate real behaviour: set runtimeData so downstream code can assert it
+				runExecutionData.executionData!.runtimeData = {
+					version: 1,
+					establishedAt: Date.now(),
+					source: 'webhook',
+					redaction: { version: 1, policy: 'none' },
+				};
+				callOrder.push('establishExecutionContext');
+			});
+
+		// Provide a valid additionalData
+		getBaseSpy = jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({
+			formWaitingBaseUrl: 'http://localhost/form',
+			webhookWaitingBaseUrl: 'http://localhost/waiting',
+		} as never);
+	});
+
+	afterEach(() => {
+		establishSpy.mockRestore();
+		getBaseSpy.mockRestore();
+	});
+
+	const buildFixtures = () => {
+		const workflowStartNode = mock<INode>({
+			name: 'Webhook',
+			type: 'n8n-nodes-base.webhook',
+			typeVersion: 2,
+			parameters: {},
+		});
+
+		const webhookData = mock<IWebhookData>({
+			node: 'Webhook',
+			workflowId: 'wf-1',
+			webhookDescription: {
+				responseMode: '={{$parameter["responseMode"]}}',
+				responseCode: '={{$parameter["responseCode"]}}',
+				responseData: '={{$parameter["responseData"]}}',
+				responsePropertyName: undefined,
+				responseContentType: undefined,
+				responseBinaryPropertyName: undefined,
+				responseHeaders: undefined,
+			} as never,
+		});
+
+		const expression = {
+			getSimpleParameterValue: jest.fn((_node, _expr, _mode, _keys, _runIndex, fallback) => {
+				// Return 'onReceived' for responseMode, 200 for responseCode, fallback otherwise
+				if (fallback === 'onReceived') return 'onReceived';
+				if (fallback === 200) return 200;
+				return fallback;
+			}),
+			getComplexParameterValue: jest.fn(
+				(_node, _expr, _mode, _keys, _runIndex, fallback) => fallback,
+			),
+		};
+
+		const workflow = mock<Workflow>({
+			id: 'wf-1',
+			name: 'Test Workflow',
+		});
+		// Attach properties not covered by the mock proxy
+		(workflow as unknown as { expression: typeof expression }).expression = expression;
+		(workflow as unknown as { nodeTypes: unknown }).nodeTypes = {
+			getByNameAndVersion: jest.fn().mockReturnValue({
+				description: { name: 'webhook', properties: [] },
+			}),
+		};
+		workflow.getChildNodes.mockReturnValue([]);
+
+		const workflowData = mock<IWorkflowBase>({
+			id: 'wf-1',
+			name: 'Test Workflow',
+			nodes: [],
+			connections: {},
+		});
+
+		const req = mock<WebhookRequest>({
+			method: 'POST',
+			headers: { authorization: 'Bearer token' },
+			params: {},
+		});
+		(req as unknown as { contentType: string }).contentType = 'application/json';
+		(req as unknown as { body: unknown }).body = {};
+		(req as unknown as { query: unknown }).query = {};
+
+		const res = mock<express.Response>();
+		(res as unknown as { headersSent: boolean }).headersSent = false;
+
+		const responseCallback = jest.fn();
+
+		return { workflow, workflowStartNode, webhookData, workflowData, req, res, responseCallback };
+	};
+
+	it('calls establishExecutionContext before WorkflowRunner.run', async () => {
+		const { workflow, workflowStartNode, webhookData, workflowData, req, res, responseCallback } =
+			buildFixtures();
+
+		await executeWebhook(
+			workflow,
+			webhookData,
+			workflowData,
+			workflowStartNode,
+			'webhook',
+			undefined,
+			undefined,
+			undefined,
+			req,
+			res,
+			responseCallback,
+		);
+
+		expect(establishSpy).toHaveBeenCalledTimes(1);
+		expect(workflowRunner.run).toHaveBeenCalledTimes(1);
+		expect(callOrder).toEqual(['establishExecutionContext', 'WorkflowRunner.run']);
+	});
+
+	it('passes runExecutionData with runtimeData populated to WorkflowRunner.run', async () => {
+		const { workflow, workflowStartNode, webhookData, workflowData, req, res, responseCallback } =
+			buildFixtures();
+
+		let capturedRunData: IRunExecutionData | undefined;
+		workflowRunner.run.mockImplementation(async (data) => {
+			capturedRunData = data.executionData;
+			callOrder.push('WorkflowRunner.run');
+			return 'exec-456';
+		});
+
+		await executeWebhook(
+			workflow,
+			webhookData,
+			workflowData,
+			workflowStartNode,
+			'webhook',
+			undefined,
+			undefined,
+			undefined,
+			req,
+			res,
+			responseCallback,
+		);
+
+		expect(capturedRunData?.executionData?.runtimeData).toBeDefined();
+		expect(capturedRunData?.executionData?.runtimeData?.source).toBe('webhook');
+	});
+
+	it('invokes establishExecutionContext with the prepared runExecutionData', async () => {
+		const { workflow, workflowStartNode, webhookData, workflowData, req, res, responseCallback } =
+			buildFixtures();
+
+		await executeWebhook(
+			workflow,
+			webhookData,
+			workflowData,
+			workflowStartNode,
+			'webhook',
+			undefined,
+			undefined,
+			undefined,
+			req,
+			res,
+			responseCallback,
+		);
+
+		const [, runExecutionDataArg] = establishSpy.mock.calls[0];
+		expect(runExecutionDataArg.executionData?.nodeExecutionStack?.[0]?.node).toBe(
+			workflowStartNode,
+		);
+		// Trigger items from webhookResultData.workflowData are attached to the stack
+		expect(runExecutionDataArg.executionData?.nodeExecutionStack?.[0]?.data?.main?.[0]).toEqual([
+			{ json: { headers: { authorization: 'Bearer token' } } },
+		]);
 	});
 });

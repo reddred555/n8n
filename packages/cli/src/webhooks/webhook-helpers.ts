@@ -10,7 +10,12 @@ import type { Project } from '@n8n/db';
 import { ExecutionRepository } from '@n8n/db';
 import { Container } from '@n8n/di';
 import type express from 'express';
-import { BinaryDataService, ErrorReporter, WAITING_TOKEN_QUERY_PARAM } from 'n8n-core';
+import {
+	BinaryDataService,
+	ErrorReporter,
+	establishExecutionContext,
+	WAITING_TOKEN_QUERY_PARAM,
+} from 'n8n-core';
 import type {
 	IBinaryData,
 	IDataObject,
@@ -648,6 +653,14 @@ export async function executeWebhook(
 			workflowData,
 		);
 		runExecutionData = preparedRunExecutionData;
+
+		// Establish the execution context before handing the run off to WorkflowRunner.
+		// In queue mode, WorkflowRunner.run() persists the execution to the database
+		// before the worker picks it up; running context-establishment hooks here
+		// ensures any trigger-item transformations are applied to the data that gets
+		// persisted. The early-exit guard in establishExecutionContext (checking for
+		// existing runtimeData) makes the subsequent worker-side call a no-op.
+		await establishExecutionContext(workflow, runExecutionData, additionalData, executionMode);
 
 		const runData: IWorkflowExecutionDataProcess = {
 			executionMode,
