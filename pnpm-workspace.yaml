@@ -179,3 +179,5 @@ minimumReleaseAgeExclude:
   - underscore
   - protobufjs
   - follow-redirects
+  # Renovate security update: electron@39.8.5
+  - electron@39.8.5
