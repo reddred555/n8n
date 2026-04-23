@@ -178,3 +178,5 @@ minimumReleaseAgeExclude:
   - underscore
   - protobufjs
   - follow-redirects
+  # Renovate security update: minimatch@<=5.1.8@9.0.7
+  - minimatch@<=5.1.8@9.0.7
