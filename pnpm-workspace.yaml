@@ -178,3 +178,5 @@ minimumReleaseAgeExclude:
   - underscore
   - protobufjs
   - follow-redirects
+  # Renovate security update: @xmldom/xmldom@0.8.13
+  - "@xmldom/xmldom@0.8.13"
